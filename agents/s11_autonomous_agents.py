@@ -1,38 +1,112 @@
 #!/usr/bin/env python3
 """
-s11_autonomous_agents.py - Autonomous Agents
+s11_autonomous_agents.py - Autonomous Agents (自主 Agent)
 
-Idle cycle with task board polling, auto-claiming unclaimed tasks, and
-identity re-injection after context compression. Builds on s10's protocols.
+=== 本课要点 ===
 
-    Teammate lifecycle:
-    +-------+
-    | spawn |
-    +---+---+
-        |
+引入"自主 Agent"概念：队友可以自己找活干，不需要 Lead 一直分配任务。
+
+核心洞察：
+    "Agent 自己找工作。"
+
+=== 为什么需要自主性？ ===
+
+s09/s10 的问题：
+    - 队友完成任务后就停了
+    - 需要 Lead 手动分配下一个任务
+    - Lead 成为瓶颈
+
+s11 的解决方案：
+    - 队友完成任务后进入"空闲轮询"阶段
+    - 自动扫描任务板，认领未分配的任务
+    - 真正的"自治"——不需要 Lead 干预
+
+=== 生活中的比喻 ===
+
+想象一个自助式的工作环境：
+
+    传统模式（s09/s10）：
+    ┌─────────────────────────────────────────────────────────┐
+    │  老板: "Alice，做任务 A"                                 │
+    │  Alice: 做完了                                          │
+    │  Alice: ... 等待 ...                                    │
+    │  老板: "Alice，做任务 B"                                 │
+    │  Alice: 做完了                                          │
+    │  Alice: ... 等待 ...                                    │
+    │                                                         │
+    │  问题：老板成为瓶颈，Alice 经常闲着                       │
+    └─────────────────────────────────────────────────────────┘
+
+    自主模式（s11）：
+    ┌─────────────────────────────────────────────────────────┐
+    │  老板: "Alice，做任务 A"                                 │
+    │  Alice: 做完了                                          │
+    │  Alice: （自动）看看任务板上有没有新活...                 │
+    │  Alice: 发现任务 B，我来认领                             │
+    │  Alice: 做任务 B...                                     │
+    │  Alice: 做完了，继续看任务板...                          │
+    │                                                         │
+    │  好处：老板只需要往任务板上加任务，队友自己抢活            │
+    └─────────────────────────────────────────────────────────┘
+
+=== 队友生命周期 ===
+
+    ┌───────┐
+    │ spawn │
+    └───┬───┘
+        │
         v
-    +-------+  tool_use    +-------+
-    | WORK  | <----------- |  LLM  |
-    +---+---+              +-------+
-        |
-        | stop_reason != tool_use
+    ┌───────┐  工具调用    ┌───────┐
+    │ WORK  │ <─────────── │  LLM  │
+    └───┬───┘              └───────┘
+        │
+        │ stop_reason != tool_use
+        │ 或调用 idle 工具
         v
-    +--------+
-    | IDLE   | poll every 5s for up to 60s
-    +---+----+
-        |
-        +---> check inbox -> message? -> resume WORK
-        |
-        +---> scan .tasks/ -> unclaimed? -> claim -> resume WORK
-        |
-        +---> timeout (60s) -> shutdown
+    ┌────────┐
+    │  IDLE  │ 每 5 秒轮询，最多 60 秒
+    └───┬────┘
+        │
+        ├──→ 检查收件箱 → 有消息? → 恢复 WORK
+        │
+        ├──→ 扫描 .tasks/ → 有未认领任务? → 认领 → 恢复 WORK
+        │
+        └──→ 超时 (60秒) → 自动关闭
 
-    Identity re-injection after compression:
-    messages = [identity_block, ...remaining...]
-    "You are 'coder', role: backend, team: my-team"
+=== 身份重注入 ===
 
-Key insight: "The agent finds work itself."
+问题：上下文压缩后，Agent 可能忘记自己是谁
+
+解决：压缩后重新注入身份信息
+
+    压缩前：
+    messages = [很多历史消息...]
+
+    压缩后：
+    messages = [
+        <identity>You are 'coder', role: backend, team: my-team</identity>,
+        "I am coder. Continuing.",
+        ...剩余消息...
+    ]
+
+=== 任务板（Task Board）===
+
+任务板是 .tasks/ 目录中的 JSON 文件：
+
+    .tasks/
+    ├── task_1.json  {"id":1, "status":"completed", "owner":"alice", ...}
+    ├── task_2.json  {"id":2, "status":"in_progress", "owner":"bob", ...}
+    └── task_3.json  {"id":3, "status":"pending", "owner":"", ...}  ← 未认领！
+
+自动认领条件：
+    - status == "pending"
+    - owner == "" (无人认领)
+    - blockedBy == [] (无阻塞依赖)
 """
+
+# ============================================================================
+# 第一部分：导入依赖
+# ============================================================================
 
 import json
 import os
@@ -45,6 +119,10 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+# ============================================================================
+# 第二部分：初始化配置
+# ============================================================================
+
 load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
@@ -52,15 +130,20 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
+
+# 目录配置
 TEAM_DIR = WORKDIR / ".team"
 INBOX_DIR = TEAM_DIR / "inbox"
 TASKS_DIR = WORKDIR / ".tasks"
 
-POLL_INTERVAL = 5
-IDLE_TIMEOUT = 60
+# === 自主性配置 ===
+POLL_INTERVAL = 5   # 空闲时轮询间隔（秒）
+IDLE_TIMEOUT = 60   # 空闲超时时间（秒），超时后自动关闭
 
+# Lead 的系统提示词
 SYSTEM = f"You are a team lead at {WORKDIR}. Teammates are autonomous -- they find work themselves."
 
+# 有效的消息类型
 VALID_MSG_TYPES = {
     "message",
     "broadcast",
@@ -69,15 +152,29 @@ VALID_MSG_TYPES = {
     "plan_approval_response",
 }
 
-# -- Request trackers --
+
+# ============================================================================
+# 第三部分：请求跟踪器和锁
+# ============================================================================
+
+# 关闭请求跟踪
 shutdown_requests = {}
+# 计划审批跟踪
 plan_requests = {}
+
+# 跟踪器锁
 _tracker_lock = threading.Lock()
+# 任务认领锁（防止多个队友同时认领同一个任务）
 _claim_lock = threading.Lock()
 
 
-# -- MessageBus: JSONL inbox per teammate --
+# ============================================================================
+# 第四部分：MessageBus 类（与 s09/s10 相同）
+# ============================================================================
+
 class MessageBus:
+    """消息总线：管理所有队友的收件箱"""
+
     def __init__(self, inbox_dir: Path):
         self.dir = inbox_dir
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -122,41 +219,111 @@ class MessageBus:
 BUS = MessageBus(INBOX_DIR)
 
 
-# -- Task board scanning --
+# ============================================================================
+# 第五部分：任务板扫描和认领（本课核心功能之一）
+# ============================================================================
+
 def scan_unclaimed_tasks() -> list:
+    """
+    扫描任务板，找出所有未认领的任务。
+
+    未认领的条件：
+    1. status == "pending" (待处理)
+    2. owner == "" (无人认领)
+    3. blockedBy == [] (无阻塞依赖)
+
+    Returns:
+        未认领任务列表
+    """
     TASKS_DIR.mkdir(exist_ok=True)
     unclaimed = []
+
     for f in sorted(TASKS_DIR.glob("task_*.json")):
         task = json.loads(f.read_text())
+
+        # 检查是否满足认领条件
         if (task.get("status") == "pending"
                 and not task.get("owner")
                 and not task.get("blockedBy")):
             unclaimed.append(task)
+
     return unclaimed
 
 
 def claim_task(task_id: int, owner: str) -> str:
+    """
+    认领一个任务。
+
+    使用锁保护，防止多个队友同时认领同一个任务。
+
+    Args:
+        task_id: 任务 ID
+        owner: 认领者名称
+
+    Returns:
+        认领结果消息
+    """
+    # 使用锁保护，确保原子性
     with _claim_lock:
         path = TASKS_DIR / f"task_{task_id}.json"
         if not path.exists():
             return f"Error: Task {task_id} not found"
+
         task = json.loads(path.read_text())
+
+        # 更新任务状态
         task["owner"] = owner
         task["status"] = "in_progress"
+
         path.write_text(json.dumps(task, indent=2))
+
     return f"Claimed task #{task_id} for {owner}"
 
 
-# -- Identity re-injection after compression --
+# ============================================================================
+# 第六部分：身份重注入（本课核心功能之二）
+# ============================================================================
+
 def make_identity_block(name: str, role: str, team_name: str) -> dict:
+    """
+    创建身份信息块。
+
+    当上下文被压缩后，Agent 可能忘记自己是谁。
+    这个函数创建一个身份提醒消息，注入到对话开头。
+
+    为什么需要这个？
+    - 压缩后 messages 可能只剩下摘要
+    - Agent 需要知道自己的名字、角色、所属团队
+    - 否则它可能表现得像一个"新人"
+
+    Args:
+        name: 队友名称
+        role: 队友角色
+        team_name: 团队名称
+
+    Returns:
+        身份信息消息（user 角色）
+    """
     return {
         "role": "user",
         "content": f"<identity>You are '{name}', role: {role}, team: {team_name}. Continue your work.</identity>",
     }
 
 
-# -- Autonomous TeammateManager --
+# ============================================================================
+# 第七部分：TeammateManager 类（支持自主性）
+# ============================================================================
+
 class TeammateManager:
+    """
+    队友管理器：支持自主工作的队友。
+
+    与 s10 的核心区别：
+    1. 队友有 WORK 和 IDLE 两个阶段
+    2. IDLE 阶段会自动轮询任务板
+    3. 发现未认领任务时自动认领并恢复工作
+    """
+
     def __init__(self, team_dir: Path):
         self.dir = team_dir
         self.dir.mkdir(exist_ok=True)
@@ -179,12 +346,14 @@ class TeammateManager:
         return None
 
     def _set_status(self, name: str, status: str):
+        """更新队友状态"""
         member = self._find_member(name)
         if member:
             member["status"] = status
             self._save_config()
 
     def spawn(self, name: str, role: str, prompt: str) -> str:
+        """创建或激活队友"""
         member = self._find_member(name)
         if member:
             if member["status"] not in ("idle", "shutdown"):
@@ -204,24 +373,61 @@ class TeammateManager:
         thread.start()
         return f"Spawned '{name}' (role: {role})"
 
+    # -------------------------------------------------------------------------
+    # 自主队友的主循环（本课核心）
+    # -------------------------------------------------------------------------
+
     def _loop(self, name: str, role: str, prompt: str):
+        """
+        自主队友的主循环。
+
+        这是 s11 的核心创新！循环有两个阶段：
+
+        1. WORK 阶段：
+           - 标准的 Agent 循环
+           - 执行工具调用
+           - 直到 LLM 停止或调用 idle 工具
+
+        2. IDLE 阶段：
+           - 每 POLL_INTERVAL 秒轮询一次
+           - 检查收件箱（有新消息？）
+           - 扫描任务板（有未认领任务？）
+           - 最多等待 IDLE_TIMEOUT 秒
+           - 超时则自动关闭
+
+        这个设计让队友能够：
+        - 完成一个任务后自动找下一个
+        - 响应 Lead 的消息
+        - 在没有工作时自动关闭（节省资源）
+        """
         team_name = self.config["team_name"]
+
+        # 系统提示词：告诉队友它是自主的
         sys_prompt = (
             f"You are '{name}', role: {role}, team: {team_name}, at {WORKDIR}. "
             f"Use idle tool when you have no more work. You will auto-claim new tasks."
         )
+
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()
 
+        # === 主循环：WORK → IDLE → WORK → IDLE → ... ===
         while True:
-            # -- WORK PHASE: standard agent loop --
+
+            # ============================================================
+            # WORK 阶段：标准 Agent 循环
+            # ============================================================
             for _ in range(50):
+                # 检查收件箱
                 inbox = BUS.read_inbox(name)
                 for msg in inbox:
+                    # 收到关闭请求，立即退出
                     if msg.get("type") == "shutdown_request":
                         self._set_status(name, "shutdown")
                         return
                     messages.append({"role": "user", "content": json.dumps(msg)})
+
+                # 调用 LLM
                 try:
                     response = client.messages.create(
                         model=MODEL,
@@ -233,34 +439,49 @@ class TeammateManager:
                 except Exception:
                     self._set_status(name, "idle")
                     return
+
                 messages.append({"role": "assistant", "content": response.content})
+
                 if response.stop_reason != "tool_use":
                     break
+
+                # 执行工具
                 results = []
                 idle_requested = False
+
                 for block in response.content:
                     if block.type == "tool_use":
+                        # === 关键：检测 idle 工具 ===
                         if block.name == "idle":
                             idle_requested = True
                             output = "Entering idle phase. Will poll for new tasks."
                         else:
                             output = self._exec(name, block.name, block.input)
+
                         print(f"  [{name}] {block.name}: {str(output)[:120]}")
                         results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
                             "content": str(output),
                         })
+
                 messages.append({"role": "user", "content": results})
+
+                # 如果请求了 idle，跳出 WORK 阶段
                 if idle_requested:
                     break
 
-            # -- IDLE PHASE: poll for inbox messages and unclaimed tasks --
+            # ============================================================
+            # IDLE 阶段：轮询收件箱和任务板
+            # ============================================================
             self._set_status(name, "idle")
             resume = False
             polls = IDLE_TIMEOUT // max(POLL_INTERVAL, 1)
+
             for _ in range(polls):
                 time.sleep(POLL_INTERVAL)
+
+                # --- 检查 1：收件箱 ---
                 inbox = BUS.read_inbox(name)
                 if inbox:
                     for msg in inbox:
@@ -270,29 +491,50 @@ class TeammateManager:
                         messages.append({"role": "user", "content": json.dumps(msg)})
                     resume = True
                     break
+
+                # --- 检查 2：任务板 ---
                 unclaimed = scan_unclaimed_tasks()
                 if unclaimed:
+                    # 认领第一个未认领的任务
                     task = unclaimed[0]
                     claim_task(task["id"], name)
+
+                    # 构造任务提示
                     task_prompt = (
                         f"<auto-claimed>Task #{task['id']}: {task['subject']}\n"
                         f"{task.get('description', '')}</auto-claimed>"
                     )
+
+                    # === 关键：身份重注入 ===
+                    # 如果 messages 很少，可能是压缩后的状态
+                    # 需要重新注入身份信息
                     if len(messages) <= 3:
                         messages.insert(0, make_identity_block(name, role, team_name))
                         messages.insert(1, {"role": "assistant", "content": f"I am {name}. Continuing."})
+
+                    # 添加任务提示
                     messages.append({"role": "user", "content": task_prompt})
                     messages.append({"role": "assistant", "content": f"Claimed task #{task['id']}. Working on it."})
+
                     resume = True
                     break
 
+            # --- 检查是否应该恢复工作 ---
             if not resume:
+                # 超时，没有新工作，自动关闭
                 self._set_status(name, "shutdown")
                 return
+
+            # 恢复工作
             self._set_status(name, "working")
 
+    # -------------------------------------------------------------------------
+    # 队友的工具执行
+    # -------------------------------------------------------------------------
+
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
-        # these base tools are unchanged from s02
+        """执行队友的工具调用"""
+        # 基础工具
         if tool_name == "bash":
             return _run_bash(args["command"])
         if tool_name == "read_file":
@@ -305,6 +547,8 @@ class TeammateManager:
             return BUS.send(sender, args["to"], args["content"], args.get("msg_type", "message"))
         if tool_name == "read_inbox":
             return json.dumps(BUS.read_inbox(sender), indent=2)
+
+        # 协议工具
         if tool_name == "shutdown_response":
             req_id = args["request_id"]
             with _tracker_lock:
@@ -315,6 +559,7 @@ class TeammateManager:
                 "shutdown_response", {"request_id": req_id, "approve": args["approve"]},
             )
             return f"Shutdown {'approved' if args['approve'] else 'rejected'}"
+
         if tool_name == "plan_approval":
             plan_text = args.get("plan", "")
             req_id = str(uuid.uuid4())[:8]
@@ -325,13 +570,23 @@ class TeammateManager:
                 {"request_id": req_id, "plan": plan_text},
             )
             return f"Plan submitted (request_id={req_id}). Waiting for approval."
+
+        # 新增：手动认领任务
         if tool_name == "claim_task":
             return claim_task(args["task_id"], sender)
+
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
-        # these base tools are unchanged from s02
+        """
+        队友可用的工具列表。
+
+        新增工具：
+        - idle: 主动进入空闲状态
+        - claim_task: 手动认领任务
+        """
         return [
+            # 基础工具
             {"name": "bash", "description": "Run a shell command.",
              "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
             {"name": "read_file", "description": "Read file contents.",
@@ -348,10 +603,24 @@ class TeammateManager:
              "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "reason": {"type": "string"}}, "required": ["request_id", "approve"]}},
             {"name": "plan_approval", "description": "Submit a plan for lead approval.",
              "input_schema": {"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"]}},
-            {"name": "idle", "description": "Signal that you have no more work. Enters idle polling phase.",
-             "input_schema": {"type": "object", "properties": {}}},
-            {"name": "claim_task", "description": "Claim a task from the task board by ID.",
-             "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
+
+            # 新增：空闲工具
+            {
+                "name": "idle",
+                "description": "Signal that you have no more work. Enters idle polling phase.",
+                "input_schema": {"type": "object", "properties": {}}
+            },
+
+            # 新增：任务认领
+            {
+                "name": "claim_task",
+                "description": "Claim a task from the task board by ID.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"task_id": {"type": "integer"}},
+                    "required": ["task_id"]
+                }
+            },
         ]
 
     def list_all(self) -> str:
@@ -369,7 +638,10 @@ class TeammateManager:
 TEAM = TeammateManager(TEAM_DIR)
 
 
-# -- Base tool implementations (these base tools are unchanged from s02) --
+# ============================================================================
+# 第八部分：基础工具实现函数
+# ============================================================================
+
 def _safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -424,7 +696,10 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
-# -- Lead-specific protocol handlers --
+# ============================================================================
+# 第九部分：Lead 专用的协议处理函数
+# ============================================================================
+
 def handle_shutdown_request(teammate: str) -> str:
     req_id = str(uuid.uuid4())[:8]
     with _tracker_lock:
@@ -455,26 +730,44 @@ def _check_shutdown_status(request_id: str) -> str:
         return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
 
 
-# -- Lead tool dispatch (14 tools) --
+# ============================================================================
+# 第十部分：Lead 的工具分发映射
+# ============================================================================
+
+# Lead 有 14 个工具
 TOOL_HANDLERS = {
+    # 基础工具
     "bash":              lambda **kw: _run_bash(kw["command"]),
     "read_file":         lambda **kw: _run_read(kw["path"], kw.get("limit")),
     "write_file":        lambda **kw: _run_write(kw["path"], kw["content"]),
     "edit_file":         lambda **kw: _run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+
+    # 团队管理
     "spawn_teammate":    lambda **kw: TEAM.spawn(kw["name"], kw["role"], kw["prompt"]),
     "list_teammates":    lambda **kw: TEAM.list_all(),
+
+    # 通信
     "send_message":      lambda **kw: BUS.send("lead", kw["to"], kw["content"], kw.get("msg_type", "message")),
     "read_inbox":        lambda **kw: json.dumps(BUS.read_inbox("lead"), indent=2),
     "broadcast":         lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
+
+    # 协议
     "shutdown_request":  lambda **kw: handle_shutdown_request(kw["teammate"]),
     "shutdown_response": lambda **kw: _check_shutdown_status(kw.get("request_id", "")),
     "plan_approval":     lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),
+
+    # 自主性相关（Lead 一般不用）
     "idle":              lambda **kw: "Lead does not idle.",
     "claim_task":        lambda **kw: claim_task(kw["task_id"], "lead"),
 }
 
-# these base tools are unchanged from s02
+
+# ============================================================================
+# 第十一部分：Lead 的工具定义列表
+# ============================================================================
+
 TOOLS = [
+    # 基础工具
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
@@ -483,22 +776,30 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+
+    # 团队管理
     {"name": "spawn_teammate", "description": "Spawn an autonomous teammate.",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}, "role": {"type": "string"}, "prompt": {"type": "string"}}, "required": ["name", "role", "prompt"]}},
     {"name": "list_teammates", "description": "List all teammates.",
      "input_schema": {"type": "object", "properties": {}}},
+
+    # 通信
     {"name": "send_message", "description": "Send a message to a teammate.",
      "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
     {"name": "read_inbox", "description": "Read and drain the lead's inbox.",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "broadcast", "description": "Send a message to all teammates.",
      "input_schema": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}},
+
+    # 协议
     {"name": "shutdown_request", "description": "Request a teammate to shut down.",
      "input_schema": {"type": "object", "properties": {"teammate": {"type": "string"}}, "required": ["teammate"]}},
     {"name": "shutdown_response", "description": "Check shutdown request status.",
      "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}}, "required": ["request_id"]}},
     {"name": "plan_approval", "description": "Approve or reject a teammate's plan.",
      "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, "required": ["request_id", "approve"]}},
+
+    # 自主性
     {"name": "idle", "description": "Enter idle state (for lead -- rarely used).",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "claim_task", "description": "Claim a task from the board by ID.",
@@ -506,7 +807,32 @@ TOOLS = [
 ]
 
 
+# ============================================================================
+# 第十二部分：序列化响应内容
+# ============================================================================
+
+def serialize_content(content):
+    """将 API 响应转换为可序列化的字典格式"""
+    result = []
+    for block in content:
+        if block.type == "text":
+            result.append({"type": "text", "text": block.text})
+        elif block.type == "tool_use":
+            result.append({
+                "type": "tool_use",
+                "id": block.id,
+                "name": block.name,
+                "input": block.input
+            })
+    return result
+
+
+# ============================================================================
+# 第十三部分：Lead 的 Agent 循环
+# ============================================================================
+
 def agent_loop(messages: list):
+    """Lead 的 Agent 循环"""
     while True:
         inbox = BUS.read_inbox("lead")
         if inbox:
@@ -518,6 +844,7 @@ def agent_loop(messages: list):
                 "role": "assistant",
                 "content": "Noted inbox messages.",
             })
+
         response = client.messages.create(
             model=MODEL,
             system=SYSTEM,
@@ -525,9 +852,12 @@ def agent_loop(messages: list):
             tools=TOOLS,
             max_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
+
+        messages.append({"role": "assistant", "content": serialize_content(response.content)})
+
         if response.stop_reason != "tool_use":
             return
+
         results = []
         for block in response.content:
             if block.type == "tool_use":
@@ -536,24 +866,66 @@ def agent_loop(messages: list):
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
+
                 print(f"> {block.name}: {str(output)[:200]}")
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
                     "content": str(output),
                 })
+
         messages.append({"role": "user", "content": results})
 
 
+# ============================================================================
+# 第十四部分：主程序入口
+# ============================================================================
+
 if __name__ == "__main__":
+    """
+    交互式命令行界面。
+
+    使用示例：
+        s11 >> 创建两个自主队友，让他们自动完成任务板上的工作
+
+    观察自主行为：
+        1. Lead 创建队友并分配初始任务
+        2. 队友完成后调用 idle 进入空闲
+        3. 队友自动扫描任务板
+        4. 发现新任务，自动认领并开始工作
+        5. 60 秒无新任务，自动关闭
+
+    快捷命令：
+        /team  - 查看团队状态
+        /inbox - 查看 Lead 的收件箱
+        /tasks - 查看任务板
+
+    测试自主性：
+        1. 先创建一些任务（用 s07 的任务工具）
+        2. 然后 spawn 一个队友，不给具体任务
+        3. 观察队友自动认领任务板上的任务
+    """
     history = []
+
+    print("=" * 60)
+    print("s11_autonomous_agents.py - 自主 Agent 示例")
+    print("新增功能: idle 工具, claim_task, 自动轮询任务板")
+    print("自主行为: 空闲时自动扫描任务板，认领未分配任务")
+    print(f"配置: POLL_INTERVAL={POLL_INTERVAL}s, IDLE_TIMEOUT={IDLE_TIMEOUT}s")
+    print("快捷命令: /team, /inbox, /tasks")
+    print("输入 'q' 或 'exit' 退出")
+    print("=" * 60)
+
     while True:
         try:
             query = input("\033[36ms11 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
+
         if query.strip().lower() in ("q", "exit", ""):
             break
+
+        # 快捷命令
         if query.strip() == "/team":
             print(TEAM.list_all())
             continue
@@ -568,11 +940,17 @@ if __name__ == "__main__":
                 owner = f" @{t['owner']}" if t.get("owner") else ""
                 print(f"  {marker} #{t['id']}: {t['subject']}{owner}")
             continue
+
         history.append({"role": "user", "content": query})
         agent_loop(history)
+
+        # 打印模型的文字回复
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:
-                if hasattr(block, "text"):
+                if isinstance(block, dict) and block.get("type") == "text":
+                    print(block["text"])
+                elif hasattr(block, "text"):
                     print(block.text)
+
         print()
